@@ -47,6 +47,77 @@ INPUT_PROCESSING_DICT = {
 }
 
 
+def _compute_centroids_from_segmask(hcr_dir: Path):
+    """Compute HCR cell centroids from the level-2 cell-body segmentation mask zarr.
+
+    Used when cell_body_segmentation/cell_centroids.npy is absent (e.g. pan-neuronal
+    subjects where nuclear segmentation was not run).  Mirrors the accumulation logic
+    in feat_tight_bbox.build_tight_bbox but without scoping to existing centroids.
+
+    Returns a pandas DataFrame with columns [hcr_id, z_px, y_px, x_px] in level-2
+    pixel coordinates — the same contract as benchmark_data_loader._load_hcr_centroids.
+    """
+    import numpy as np
+    import pandas as pd
+    import zarr
+    import scipy.ndimage as ndi
+
+    seg_path = Path(hcr_dir) / "cell_body_segmentation" / "segmentation_mask_orig_res.zarr"
+    if not seg_path.exists():
+        raise FileNotFoundError(
+            f"segmentation_mask_orig_res.zarr not found at {seg_path}; "
+            "cannot compute HCR centroids (cell body segmentation required)")
+
+    print(f"[centroid] Computing centroids from {seg_path}", flush=True)
+    seg = zarr.open(str(seg_path), mode="r")
+    _, _, Z, Y, X = seg.shape   # (1, 1, Z, Y, X) — level-2 pixel frame
+
+    print(f"[centroid] Volume shape: (Z={Z}, Y={Y}, X={X})", flush=True)
+
+    STRIP = 128
+    acc = {}   # hid -> [zsum, ysum, xsum, voxel_count]
+
+    for z0 in range(0, Z, STRIP):
+        z1 = min(z0 + STRIP, Z)
+        strip = np.asarray(seg[0, 0, z0:z1, :, :])   # (dz, Y, X)
+        slices = ndi.find_objects(strip)
+        for lbl_idx, sl in enumerate(slices):
+            if sl is None:
+                continue
+            hid = lbl_idx + 1          # find_objects is 0-indexed, labels are 1-indexed
+            sl_z, sl_y, sl_x = sl
+            mask = strip[sl] == hid
+            n = int(mask.sum())
+            if n == 0:
+                continue
+            zc, yc, xc = np.where(mask)
+            z_g = (zc + z0 + sl_z.start).astype(float)
+            y_g = (yc + sl_y.start).astype(float)
+            x_g = (xc + sl_x.start).astype(float)
+            if hid in acc:
+                acc[hid][0] += z_g.sum()
+                acc[hid][1] += y_g.sum()
+                acc[hid][2] += x_g.sum()
+                acc[hid][3] += n
+            else:
+                acc[hid] = [z_g.sum(), y_g.sum(), x_g.sum(), n]
+
+    if not acc:
+        raise RuntimeError(f"No labeled cells found in {seg_path}")
+
+    rows = [[zs / n, ys / n, xs / n, float(hid)]
+            for hid, (zs, ys, xs, n) in sorted(acc.items())]
+    arr = np.array(rows, dtype=float)   # (N, 4): [z_px, y_px, x_px, hcr_id]
+    print(f"[centroid] Computed {len(arr)} cell centroids", flush=True)
+
+    return pd.DataFrame({
+        "hcr_id": arr[:, 3].astype(int),
+        "z_px":   arr[:, 0],
+        "y_px":   arr[:, 1],
+        "x_px":   arr[:, 2],
+    })
+
+
 def _find_model_dir(data_root: Path) -> Path:
     """Locate the model by FORMAT: the directory that actually contains BOTH
     roi_quality_4class.txt and roi_quality_meta.json, at any depth (rglob) — handles a
@@ -109,6 +180,21 @@ def main() -> int:
     os.environ["MFISH_MODELS_DIR"] = models_dir
     if args.feat_workers > 0:
         os.environ["MFISH_FEAT_WORKERS"] = str(args.feat_workers)
+
+    # Patch centroid loader to compute from the level-2 segmentation mask when the
+    # NPY file is absent (pan-neuronal subjects where nuclear segmentation was not run).
+    import roi_classifier.benchmark_data_loader as _bdl
+    _orig_load_centroids = _bdl._load_hcr_centroids
+
+    def _patched_load_centroids(hcr_dir, coreg_dir=None):
+        try:
+            return _orig_load_centroids(hcr_dir, coreg_dir)
+        except FileNotFoundError:
+            print("[capsule] centroid NPY absent — computing from segmentation mask ...",
+                  flush=True)
+            return _compute_centroids_from_segmask(Path(hcr_dir))
+
+    _bdl._load_hcr_centroids = _patched_load_centroids
 
     # ── in-process: build features, then predict (no CLI subprocess) ─────────────
     from roi_classifier import config as cfg
